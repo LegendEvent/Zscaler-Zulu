@@ -17,6 +17,26 @@ class ZuluZscaler:
         "mycompany.com"
     ]
 
+    def poll_until_completed(self, url, timeout=600, interval=5, verbose=False):
+        """
+        Poll analyze_url every `interval` seconds until status is 'Completed' or timeout (in seconds) is reached.
+        Returns the final result dict (with analysis) or the last result if timeout.
+        """
+        import time
+        start = time.time()
+        while True:
+            result = self.analyze_url(url)
+            status = result.get('Status', '').lower() if result.get('Status') else ''
+            if verbose:
+                print(f"Status: {result.get('Status', 'Unknown')}")
+            if status == 'completed':
+                return result
+            if time.time() - start > timeout:
+                if verbose:
+                    print("Timeout reached.")
+                return result
+            time.sleep(interval)
+
     def __init__(self, default_safe_domains: list[str] = None, verify_ssl: bool = True):
         """
         default_safe_domains: Optional custom list of safe domains (overrides DEFAULT_SAFE_DOMAINS)
@@ -86,8 +106,8 @@ class ZuluZscaler:
             print(f"Error in is_safe_domain: {str(e)}")
             return False
 
-    def analyze_url(self, url: str) -> dict:
-        """Analyze a URL using Zulu Zscaler and return result as dict"""
+    def analyze_url(self, url):
+        """Analyze a URL using Zulu Zscaler"""
         # Ensure URL has a scheme for the analysis
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -134,96 +154,105 @@ class ZuluZscaler:
             allow_redirects=True
         )
 
+        # Extract status from the report page
+        status_match = re.search(r'<span class="left">Status</span>\s*<span[^>]*>([^<]+)</span>', response.text)
+        scan_status = status_match.group(1).strip() if status_match else None
+
         result = {
             'url': url,
             'status_code': response.status_code,
-            'content_type': response.headers.get('content-type')
+            'content_type': response.headers.get('content-type'),
+            'Status': scan_status
         }
 
-        # Extract last performed date
-        performed_match = re.search(r'Performed on ([^<]+)', response.text)
-        if performed_match:
-            result['last_performed'] = performed_match.group(1).strip()
+        # Only parse and return analysis if status is Completed
+        if scan_status and scan_status.lower() == 'completed':
+            # Extract last performed date
+            performed_match = re.search(r'Performed on ([^<]+)', response.text)
+            if performed_match:
+                result['last_performed'] = performed_match.group(1).strip()
 
-        # Extract score and classification
-        score_match = re.search(r'<span id="jscore"[^>]*>(\d+)</span>', response.text)
-        if score_match:
-            result['score'] = int(score_match.group(1))
-            
-        class_match = re.search(r'<span class="report-icon [^"]+">([^<]+)</span>', response.text)
-        if class_match:
-            result['classification'] = class_match.group(1)
+            # Extract score and classification
+            score_match = re.search(r'<span id="jscore"[^>]*>(\d+)</span>', response.text)
+            if score_match:
+                result['score'] = int(score_match.group(1))
 
-        # Extract Analysis section
-        analysis = {}
-        
-        # Basic Analysis
-        fields = {
-            'redirections': r'id="rep-redir">([^<]+)</span>',
-            'http_status': r'id="rep-code">([^<]+)</span>',
-            'content_size': r'id="rep-size">([^<]+)</span>',
-            'content_type': r'id="rep-cont-type">([^<]+)</span>',
-            'ip_address': r'id="rep-ip">([^<]+)</span>',
-            'country': r'id="rep-country">([^<]+)</span>',
-            'web_server': r'id="rep-web-server">([^<]+)</span>'
-        }
-        
-        for key, pattern in fields.items():
-            match = re.search(pattern, response.text)
-            if match:
-                analysis[key] = match.group(1).strip()
+            class_match = re.search(r'<span class="report-icon [^"]+">([^<]+)</span>', response.text)
+            if class_match:
+                result['classification'] = class_match.group(1)
 
-        # Domain History
-        domain_history = []
-        history_pattern = r'<p class="" id="rep-domain-hist">\s*<span class="first fg-color-mid-gray">([^<]+)</span>\s*<span class="second[^"]*"><a href="([^"]+)">([^<]+)</a></span>'
-        for match in re.finditer(history_pattern, response.text):
-            domain_history.append({
-                'date': match.group(1).strip(),
-                'report_id': match.group(2).strip('/report/'),
-                'url': match.group(3).strip(' ..')
-            })
-        if domain_history:
-            analysis['domain_history'] = domain_history
+            # Extract Analysis section
+            analysis = {}
 
-        result['analysis'] = analysis
+            # Basic Analysis
+            fields = {
+                'redirections': r'id="rep-redir">([^<]+)</span>',
+                'http_status': r'id="rep-code">([^<]+)</span>',
+                'content_size': r'id="rep-size">([^<]+)</span>',
+                'content_type': r'id="rep-cont-type">([^<]+)</span>',
+                'ip_address': r'id="rep-ip">([^<]+)</span>',
+                'country': r'id="rep-country">([^<]+)</span>',
+                'web_server': r'id="rep-web-server">([^<]+)</span>'
+            }
 
-        # Extract sections with checks
-        sections = {
-            'external_elements': 'External Elements</h1>',
-            'content_checks': 'Content Checks</h1>',
-            'url_checks': 'URL Checks</h1>',
-            'host_checks': 'Host Checks</h1>'
-        }
+            for key, pattern in fields.items():
+                match = re.search(pattern, response.text)
+                if match:
+                    analysis[key] = match.group(1).strip()
 
-        for section_key, section_header in sections.items():
-            items = []
-            # Fix escape sequence and improve pattern to find table content
-            section_pattern = f'<h1 class="margin-bottom-16">{section_header.replace("</h1>", "")}.*?<table.*?<tbody.*?>(.*?)</tbody>'
-            section = re.search(section_pattern, response.text, re.DOTALL)
-            
-            if section:
-                if section_key == 'external_elements':
-                    # Pattern for external elements with links
-                    pattern = r'<tr>\s*<td class="link"><a[^>]*>([^<]+)</a></td>\s*<td><span[^>]*>([^<]+)</span></td>\s*</tr>'
-                    for match in re.finditer(pattern, section.group(1)):
-                        items.append({
-                            'url': match.group(1).strip(' ..'),
-                            'risk': match.group(2).strip()
-                        })
-                else:
-                    # Pattern for Content, URL and Host Checks - considers empty descriptions
-                    pattern = r'<tr>\s*<td[^>]*><span class="report-icon-after">([^<]+)</span></td>\s*<td>([^<]*)</td>\s*<td class="fixed">([^<]+)</td>\s*</tr>'
-                    for match in re.finditer(pattern, section.group(1)):
-                        test = match.group(1).strip()
-                        description = match.group(2).strip()
-                        risk = match.group(3).strip()
-                        items.append({
-                            'test': test,
-                            'description': description,
-                            'risk': risk
-                        })
-            if items:
-                result[section_key] = items
+            # Domain History
+            domain_history = []
+            history_pattern = r'<p class="" id="rep-domain-hist">\s*<span class="first fg-color-mid-gray">([^<]+)</span>\s*<span class="second[^"]*"><a href="([^"]+)">([^<]+)</a></span>'
+            for match in re.finditer(history_pattern, response.text):
+                domain_history.append({
+                    'date': match.group(1).strip(),
+                    'report_id': match.group(2).strip('/report/'),
+                    'url': match.group(3).strip(' ..')
+                })
+            if domain_history:
+                analysis['domain_history'] = domain_history
+
+            result['analysis'] = analysis
+
+            # Extract sections with checks
+            sections = {
+                'external_elements': 'External Elements</h1>',
+                'content_checks': 'Content Checks</h1>',
+                'url_checks': 'URL Checks</h1>',
+                'host_checks': 'Host Checks</h1>'
+            }
+
+            for section_key, section_header in sections.items():
+                items = []
+                # Fix escape sequence and improve pattern to find table content
+                section_pattern = f'<h1 class="margin-bottom-16">{section_header.replace("</h1>", "")}.*?<table.*?<tbody.*?>(.*?)</tbody>'
+                section = re.search(section_pattern, response.text, re.DOTALL)
+
+                if section:
+                    if section_key == 'external_elements':
+                        # Pattern für externe Elemente mit Links
+                        pattern = r'<tr>\s*<td class="link"><a[^>]*>([^<]+)</a></td>\s*<td><span[^>]*>([^<]+)</span></td>\s*</tr>'
+                        for match in re.finditer(pattern, section.group(1)):
+                            items.append({
+                                'url': match.group(1).strip(' ..'),
+                                'risk': match.group(2).strip()
+                            })
+                    else:
+                        # Pattern für Content, URL und Host Checks - berücksichtigt leere Descriptions
+                        pattern = r'<tr>\s*<td[^>]*><span class="report-icon-after">([^<]+)</span></td>\s*<td>([^<]*)</td>\s*<td class="fixed">([^<]+)</td>\s*</tr>'
+                        for match in re.finditer(pattern, section.group(1)):
+                            test = match.group(1).strip()
+                            description = match.group(2).strip()
+                            risk = match.group(3).strip()
+                            items.append({
+                                'test': test,
+                                'description': description,
+                                'risk': risk
+                            })
+                if items:
+                    result[section_key] = items
+        else:
+            result['analysis'] = {}
 
         return result
 
@@ -240,7 +269,7 @@ def main():
 
     zulu = ZuluZscaler(default_safe_domains=args.safe_domains, verify_ssl=not args.no_verify)
     try:
-        result = zulu.analyze_url(args.url)
+        result = zulu.poll_until_completed(args.url)
         print(json.dumps(result, indent=2))
     except Exception as e:
         print(f"Error: {str(e)}")
