@@ -1,6 +1,8 @@
 import requests
 import re
 import json
+import time
+from typing import List, Optional, Dict, Any
 from urllib.parse import urljoin, urlparse
 import argparse
 
@@ -17,30 +19,61 @@ class ZuluZscaler:
         "mycompany.com"
     ]
 
-    def poll_until_completed(self, url, timeout=600, interval=5, verbose=False):
+    def poll_until_completed(
+        self,
+        url: str,
+        timeout: float = 600,
+        interval: float = 5,
+        max_interval: float = 30,
+        verbose: bool = False
+    ) -> Dict[str, Any]:
         """
-        Poll analyze_url every `interval` seconds until status is 'Completed' or timeout (in seconds) is reached.
-        Returns the final result dict (with analysis) or the last result if timeout.
+        Poll analyze_url with exponential backoff until status is 'Completed' or timeout.
+        
+        Args:
+            url: URL to analyze
+            timeout: Maximum time in seconds to wait (default: 600)
+            interval: Initial polling interval in seconds (default: 5)
+            max_interval: Maximum polling interval in seconds (default: 30)
+            verbose: Print status updates (default: False)
+            
+        Returns:
+            The final result dict (with analysis) or the last result if timeout.
         """
-        import time
         start = time.time()
+        current_interval = interval
+        
         while True:
             result = self.analyze_url(url)
             status = result.get('Status', '').lower() if result.get('Status') else ''
+            
             if verbose:
                 print(f"Status: {result.get('Status', 'Unknown')}")
+            
             if status == 'completed':
                 return result
-            if time.time() - start > timeout:
+            
+            elapsed = time.time() - start
+            if elapsed > timeout:
                 if verbose:
-                    print("Timeout reached.")
+                    print(f"Timeout reached after {elapsed:.1f}s")
+                result['timeout_reached'] = True
                 return result
-            time.sleep(interval)
+            
+            time.sleep(current_interval)
+            # Exponential backoff with cap
+            current_interval = min(current_interval * 1.5, max_interval)
 
-    def __init__(self, default_safe_domains: list[str] = None, verify_ssl: bool = True):
+    # Default timeout for HTTP requests (in seconds)
+    REQUEST_TIMEOUT = 30
+    
+    def __init__(self, default_safe_domains: Optional[List[str]] = None, verify_ssl: bool = True):
         """
-        default_safe_domains: Optional custom list of safe domains (overrides DEFAULT_SAFE_DOMAINS)
-        verify_ssl: Enable or disable SSL certificate verification (default: True)
+        Initialize the Zulu Zscaler analyzer.
+        
+        Args:
+            default_safe_domains: Optional custom list of safe domains (overrides DEFAULT_SAFE_DOMAINS)
+            verify_ssl: Enable or disable SSL certificate verification (default: True)
         """
         self.safe_domains = default_safe_domains if default_safe_domains is not None else self.DEFAULT_SAFE_DOMAINS
         self.session = requests.Session()
@@ -66,10 +99,13 @@ class ZuluZscaler:
             'Sec-Fetch-User': '?1'
         }
         self.csrf_token = None
-
     def init_session(self) -> str:
         """Initialize session and get initial cookies and CSRF token"""
-        response = self.session.get(self.base_url, headers=self.headers)
+        response = self.session.get(
+            self.base_url, 
+            headers=self.headers,
+            timeout=self.REQUEST_TIMEOUT
+        )
         
         csrf_patterns = [
             r'name="csrf_token"\s+value="([^"]+)"',
@@ -86,6 +122,30 @@ class ZuluZscaler:
         
         return response.text
 
+    @staticmethod
+    def _validate_url(url: str) -> str:
+        """Validate and normalize URL. Returns normalized URL or raises ValueError."""
+        if not url or not isinstance(url, str):
+            raise ValueError("URL must be a non-empty string")
+        
+        url = url.strip()
+        
+        # Add scheme if missing
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        # Parse and validate
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            raise ValueError(f"Invalid URL: could not extract domain from '{url}'")
+        
+        # Validate hostname characters (alphanumeric, hyphens, dots only)
+        hostname = parsed.netloc.split(':')[0]  # Remove port if present
+        if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$', hostname):
+            raise ValueError(f"Invalid hostname: '{hostname}' contains invalid characters")
+        
+        return url
+    
     def is_safe_domain(self, url: str) -> bool:
         """Check if the domain is in the known safe domains list"""
         try:
@@ -100,18 +160,27 @@ class ZuluZscaler:
             # Remove 'www.' if present
             if domain.startswith('www.'):
                 domain = domain[4:]
-                
+            
             return domain in self.safe_domains
         except Exception as e:
-            print(f"Error in is_safe_domain: {str(e)}")
+            # Log error but don't crash - treat unknown domains as not safe
+            import sys
+            print(f"Warning: Could not check domain safety: {str(e)}", file=sys.stderr)
             return False
 
-    def analyze_url(self, url):
-        """Analyze a URL using Zulu Zscaler"""
-        # Ensure URL has a scheme for the analysis
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
-
+    def analyze_url(self, url: str) -> Dict[str, Any]:
+        """
+        Analyze a URL using Zulu Zscaler.
+        
+        Args:
+            url: The URL to analyze
+            
+        Returns:
+            Dict containing analysis results including status, score, classification, etc.
+        """
+        # Validate and normalize URL
+        url = self._validate_url(url)
+        
         # Check if URL is from a known safe domain
         if self.is_safe_domain(url):
             return {
@@ -151,13 +220,22 @@ class ZuluZscaler:
             analyze_endpoint,
             headers=headers,
             data=data,
-            allow_redirects=True
+            allow_redirects=True,
+            timeout=self.REQUEST_TIMEOUT
         )
-
+        # Check for rate limiting
+        if response.status_code == 429:
+            return {
+                'url': url,
+                'status_code': 429,
+                'error': 'Rate limited - too many requests. Please wait before retrying.',
+                'Status': 'Rate Limited'
+            }
+        
         # Extract status from the report page
         status_match = re.search(r'<span class="left">Status</span>\s*<span[^>]*>([^<]+)</span>', response.text)
         scan_status = status_match.group(1).strip() if status_match else None
-
+        
         result = {
             'url': url,
             'status_code': response.status_code,
