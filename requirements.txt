@@ -1,1 +1,2 @@
-requests>=2.25.0
+# Core dependency - requests >=2.32.0 required for security fix (CVE-2024-35195)
+requests>=2.32.0

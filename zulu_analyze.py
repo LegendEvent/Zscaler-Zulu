@@ -2,7 +2,8 @@ import requests
 import re
 import json
 import time
-from typing import List, Optional, Dict, Any
+import sys
+import ipaddress
 from urllib.parse import urljoin, urlparse
 import argparse
 
@@ -25,8 +26,10 @@ class ZuluZscaler:
         timeout: float = 600,
         interval: float = 5,
         max_interval: float = 30,
+        max_retries: int = 100,
+        force_rescan: bool = False,
         verbose: bool = False
-    ) -> Dict[str, Any]:
+    ) -> dict:
         """
         Poll analyze_url with exponential backoff until status is 'Completed' or timeout.
         
@@ -35,22 +38,40 @@ class ZuluZscaler:
             timeout: Maximum time in seconds to wait (default: 600)
             interval: Initial polling interval in seconds (default: 5)
             max_interval: Maximum polling interval in seconds (default: 30)
+            max_retries: Maximum number of polling attempts (default: 100)
+            force_rescan: Force a fresh scan instead of cached results (default: False)
             verbose: Print status updates (default: False)
             
         Returns:
-            The final result dict (with analysis) or the last result if timeout.
+            The final result dict (with analysis) or the last result if timeout/max_retries.
         """
         start = time.time()
         current_interval = interval
+        retries = 0
+        force_used = False  # Only use force_rescan on first call
         
         while True:
-            result = self.analyze_url(url)
+            # Only pass force_rescan=True on the first call
+            use_force = force_rescan and not force_used
+            if use_force:
+                force_used = True
+            result = self.analyze_url(url, force_rescan=use_force)
             status = result.get('Status', '').lower() if result.get('Status') else ''
             
             if verbose:
-                print(f"Status: {result.get('Status', 'Unknown')}")
+                status_display = result.get('Status', 'Unknown')
+                if use_force:
+                    status_display += ' (forced rescan)'
+                print(f"Status: {status_display}")
             
             if status == 'completed':
+                return result
+            
+            retries += 1
+            if retries >= max_retries:
+                if verbose:
+                    print(f"Max retries ({max_retries}) reached")
+                result['max_retries_reached'] = True
                 return result
             
             elapsed = time.time() - start
@@ -63,11 +84,9 @@ class ZuluZscaler:
             time.sleep(current_interval)
             # Exponential backoff with cap
             current_interval = min(current_interval * 1.5, max_interval)
-
-    # Default timeout for HTTP requests (in seconds)
     REQUEST_TIMEOUT = 30
     
-    def __init__(self, default_safe_domains: Optional[List[str]] = None, verify_ssl: bool = True):
+    def __init__(self, default_safe_domains: list[str] | None = None, verify_ssl: bool = True):
         """
         Initialize the Zulu Zscaler analyzer.
         
@@ -80,8 +99,8 @@ class ZuluZscaler:
         self.session.verify = verify_ssl
         if not verify_ssl:
             import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
+            # Show warning instead of suppressing - user should know about MITM risk
+            print("WARNING: SSL certificate verification is disabled. This exposes you to MITM attacks.", file=sys.stderr)
         self.base_url = 'https://zulu.zscaler.com'
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0',
@@ -130,17 +149,38 @@ class ZuluZscaler:
         
         url = url.strip()
         
+        # Check scheme BEFORE adding prefix - detect dangerous schemes
+        # urlparse('file:///etc/passwd').scheme == 'file'
+        # urlparse('javascript:alert(1)').scheme == 'javascript'
+        temp_parsed = urlparse(url)
+        if temp_parsed.scheme and temp_parsed.scheme.lower() not in ('http', 'https', ''):
+            raise ValueError(f"Only http/https schemes are allowed, got: '{temp_parsed.scheme}'")
+        
         # Add scheme if missing
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
         # Parse and validate
         parsed = urlparse(url)
+        
         if not parsed.netloc:
             raise ValueError(f"Invalid URL: could not extract domain from '{url}'")
         
-        # Validate hostname characters (alphanumeric, hyphens, dots only)
         hostname = parsed.netloc.split(':')[0]  # Remove port if present
+        
+        # Block direct IP addresses to prevent SSRF attacks
+        # Use a flag to avoid catching our own ValueError
+        is_ip = False
+        try:
+            ipaddress.ip_address(hostname)
+            is_ip = True
+        except ValueError:
+            pass  # Not an IP address, continue validation
+        
+        if is_ip:
+            raise ValueError(f"Direct IP addresses are not allowed for security reasons: '{hostname}'")
+        
+        # Validate hostname characters (alphanumeric, hyphens, dots only)
         if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$', hostname):
             raise ValueError(f"Invalid hostname: '{hostname}' contains invalid characters")
         
@@ -168,12 +208,13 @@ class ZuluZscaler:
             print(f"Warning: Could not check domain safety: {str(e)}", file=sys.stderr)
             return False
 
-    def analyze_url(self, url: str) -> Dict[str, Any]:
+    def analyze_url(self, url: str, force_rescan: bool = False) -> dict:
         """
         Analyze a URL using Zulu Zscaler.
         
         Args:
             url: The URL to analyze
+            force_rescan: If True, force a fresh scan instead of using cached results
             
         Returns:
             Dict containing analysis results including status, score, classification, etc.
@@ -223,6 +264,7 @@ class ZuluZscaler:
             allow_redirects=True,
             timeout=self.REQUEST_TIMEOUT
         )
+        
         # Check for rate limiting
         if response.status_code == 429:
             return {
@@ -232,7 +274,48 @@ class ZuluZscaler:
                 'Status': 'Rate Limited'
             }
         
-        # Extract status from the report page
+        # Handle force_rescan: trigger a fresh analysis
+        if force_rescan:
+            # Extract report ID from the redirect URL
+            # Extract parent_id from page (more reliable than URL)
+            parent_id_match = re.search(r'id=["\']parent_id["\'][^>]*>([^<]+)<', response.text)
+            report_id_from_url = re.search(r'/report/([a-f0-9-]+)', response.url)
+            
+            # Use parent_id from page if available, fall back to URL report ID
+            original_report_id = parent_id_match.group(1) if parent_id_match else (
+                report_id_from_url.group(1) if report_id_from_url else None
+            )
+            
+            if original_report_id:
+                # POST to /reanalyze endpoint (must use form data, not JSON)
+                reanalyze_headers = {
+                    **self.headers,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-CSRF-Token': self.csrf_token,
+                    'Referer': response.url
+                }
+                
+                reanalyze_response = self.session.post(
+                    f'{self.base_url}/reanalyze',
+                    headers=reanalyze_headers,
+                    data={'id': original_report_id},
+                    timeout=self.REQUEST_TIMEOUT
+                )
+                
+                if reanalyze_response.status_code == 200:
+                    try:
+                        new_report = reanalyze_response.json()
+                        if new_report and isinstance(new_report, dict):
+                            new_report_id = new_report.get('id')
+                            if new_report_id:
+                                # Fetch the new submission page
+                                response = self.session.get(
+                                    f'{self.base_url}/submission/{new_report_id}',
+                                    headers=self.headers,
+                                    timeout=self.REQUEST_TIMEOUT
+                                )
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        pass  # Fall back to original response
         status_match = re.search(r'<span class="left">Status</span>\s*<span[^>]*>([^<]+)</span>', response.text)
         scan_status = status_match.group(1).strip() if status_match else None
         
@@ -343,16 +426,16 @@ def main():
     parser.add_argument("url", help="URL to analyze")
     parser.add_argument("--safe-domains", nargs="*", default=None, help="List of known safe domains (optional)")
     parser.add_argument("--no-verify", action="store_true", help="Disable SSL certificate verification (not recommended)")
+    parser.add_argument("--force-rescan", action="store_true", help="Force a fresh scan instead of using cached results")
     args = parser.parse_args()
 
     zulu = ZuluZscaler(default_safe_domains=args.safe_domains, verify_ssl=not args.no_verify)
     try:
-        result = zulu.poll_until_completed(args.url)
+        result = zulu.poll_until_completed(args.url, force_rescan=args.force_rescan)
         print(json.dumps(result, indent=2))
     except Exception as e:
-        print(f"Error: {str(e)}")
-        print("\nNote: Check if the Zulu Zscaler website is reachable and you are not hitting rate limits.")
-        raise
-
+        print(f"Error: {str(e)}", file=sys.stderr)
+        print("\nNote: Check if the Zulu Zscaler website is reachable and you are not hitting rate limits.", file=sys.stderr)
+        sys.exit(1)
 if __name__ == "__main__":
     main()

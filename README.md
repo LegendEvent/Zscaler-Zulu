@@ -14,6 +14,8 @@ A Python script for automated risk assessment of URLs using the Zulu Zscaler web
 - Command-line interface (CLI) for easy usage
 
 ## Requirements
+- Python 3.9+
+- `requests` library (>=2.32.0 for security fixes)
 - Python 3.8+
 - `requests` library
 
@@ -29,14 +31,14 @@ pip install -r requirements.txt
 ### Command Line
 
 ```bash
-python zulu_analyze.py <url> [--safe-domains domain1 domain2 ...] [--no-verify]
+python zulu_analyze.py <url> [--safe-domains domain1 domain2 ...] [--no-verify] [--force-rescan]
 ```
 
 #### Arguments
 - `<url>`: The URL to analyze (e.g. `https://github.com`)
 - `--safe-domains`: (Optional) List of domains considered safe (skips analysis if matched)
 - `--no-verify`: (Optional) Disable SSL certificate verification (not recommended)
-
+- `--force-rescan`: (Optional) Force a fresh scan instead of using cached results
 #### Examples
 Analyze a URL with default settings:
 ```bash
@@ -48,11 +50,15 @@ Analyze a URL and skip analysis for custom safe domains:
 python zulu_analyze.py https://github.com --safe-domains github.com example.com
 ```
 
+Force a fresh scan (ignore cached results):
+```bash
+python zulu_analyze.py https://github.com --force-rescan
+```
+
 Analyze a URL and disable SSL verification:
 ```bash
 python zulu_analyze.py https://github.com --no-verify
 ```
-
 <details>
 <summary>Example output (click to expand)</summary>
 
@@ -208,6 +214,36 @@ python zulu_analyze.py https://github.com --no-verify
 - SSL certificate verification is enabled by default for your safety.
 - Only use `--no-verify` if you understand the risks (e.g. for debugging in trusted environments).
 
+### Built-in Security Protections
+
+This tool includes several security measures to prevent abuse:
+
+1. **SSRF Protection**: Direct IP addresses (e.g., `127.0.0.1`, `10.0.0.1`, `192.168.x.x`, `169.254.169.254`) are blocked to prevent Server-Side Request Forgery attacks.
+
+2. **Scheme Validation**: Only `http://` and `https://` URLs are allowed. Dangerous schemes like `file://`, `javascript:`, `ftp://`, etc. are blocked.
+
+3. **Hostname Validation**: URL hostnames are validated to contain only valid DNS characters (alphanumeric, hyphens, dots).
+
+4. **SSL Verification**: Enabled by default. A warning is printed to stderr if you disable it with `--no-verify`.
+
+5. **Rate Limiting**: The tool handles HTTP 429 (Rate Limited) responses gracefully.
+
+### Running Tests
+
+To verify the security protections are working correctly:
+
+```bash
+python test_zulu_analyze.py
+```
+
+This will run 29 tests covering URL validation, SSRF protection, scheme blocking, and more.
+
+### Security Recommendations
+
+- **Never disable SSL verification** in production environments
+- **Keep `requests` library updated** to get security patches (requires >=2.32.0)
+- **Use the safe domains feature** to skip analysis for your trusted internal domains
+- **Report security issues** responsibly if you find any vulnerabilities
 ## Contribution
 Feel free to open issues or pull requests for improvements, bug fixes, or new features!
 
