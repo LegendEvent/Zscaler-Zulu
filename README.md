@@ -16,8 +16,6 @@ A Python script for automated risk assessment of URLs using the Zulu Zscaler web
 ## Requirements
 - Python 3.9+
 - `requests` library (>=2.32.0 for security fixes)
-- Python 3.8+
-- `requests` library
 
 ## Installation
 Clone this repository and install the required dependencies:
