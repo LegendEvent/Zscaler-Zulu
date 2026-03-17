@@ -196,13 +196,21 @@ class TestPolling(unittest.TestCase):
     """Tests for polling functionality."""
 
     def test_max_retries_parameter_exists(self):
-        """poll_until_completed should accept max_retries parameter."""
-        # This is a smoke test - we're just checking the method signature
+        """poll_until_completed should accept max_retries parameter via PollConfig."""
+        # This is a smoke test - we're just checking that PollConfig has max_retries
+        from zulu_analyze import PollConfig
+
+        # Check that PollConfig has max_retries attribute
+        self.assertTrue(hasattr(PollConfig, "__annotations__"))
+        self.assertIn("max_retries", PollConfig.__annotations__)
+        self.assertEqual(PollConfig.__annotations__["max_retries"], int)
+
+        # Also verify the method signature uses config parameter
         import inspect
 
         sig = inspect.signature(ZuluZscaler.poll_until_completed)
         params = list(sig.parameters.keys())
-        self.assertIn("max_retries", params)
+        self.assertIn("config", params)
 
     def test_force_rescan_parameter_exists(self):
         """poll_until_completed should accept force_rescan parameter."""
