@@ -5,6 +5,7 @@ import json
 import time
 import sys
 import ipaddress
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 import argparse
 
@@ -17,12 +18,32 @@ from exceptions import (
 )
 from logging_config import get_logger, configure_logging
 from result_types import (
+    UrlAnalysisResult,
     create_safe_domain_result,
     create_rate_limited_result,
 )
 
-configure_logging()
+__all__ = [
+    "ZuluZscaler",
+    "main",
+    "PollConfig",
+]
+
 logger = get_logger(__name__)
+
+
+ALLOWED_SCHEMES = ("http", "https")
+
+
+@dataclass
+class PollConfig:
+    """Configuration for polling URL analysis completion."""
+
+    timeout: float = 600  # Maximum time in seconds to wait
+    interval: float = 5  # Initial polling interval in seconds
+    max_interval: float = 30  # Maximum polling interval in seconds
+    max_retries: int = 100  # Maximum number of polling attempts
+    verbose: bool = False  # Print status updates
 
 
 class ZuluZscaler:
@@ -42,30 +63,25 @@ class ZuluZscaler:
     def poll_until_completed(
         self,
         url: str,
-        timeout: float = 600,
-        interval: float = 5,
-        max_interval: float = 30,
-        max_retries: int = 100,
         force_rescan: bool = False,
-        verbose: bool = False,
-    ) -> dict:
+        config: PollConfig | None = None,
+    ) -> UrlAnalysisResult:
         """
         Poll analyze_url with exponential backoff until status is 'Completed' or timeout.
 
         Args:
             url: URL to analyze
-            timeout: Maximum time in seconds to wait (default: 600)
-            interval: Initial polling interval in seconds (default: 5)
-            max_interval: Maximum polling interval in seconds (default: 30)
-            max_retries: Maximum number of polling attempts (default: 100)
             force_rescan: Force a fresh scan instead of cached results (default: False)
-            verbose: Print status updates (default: False)
+            config: PollConfig object with polling parameters (default: PollConfig())
 
         Returns:
             The final result dict (with analysis) or the last result if timeout/max_retries.
         """
+        if config is None:
+            config = PollConfig()
+
         start = time.time()
-        current_interval = interval
+        current_interval = config.interval
         retries = 0
         force_used = False  # Only use force_rescan on first call
 
@@ -75,10 +91,10 @@ class ZuluZscaler:
             if use_force:
                 force_used = True
             result = self.analyze_url(url, force_rescan=use_force)
-            status = result.get("Status", "").lower() if result.get("Status") else ""
+            status = result.get("status", "").lower() if result.get("status") else ""
 
-            if verbose:
-                status_display = result.get("Status", "Unknown")
+            if config.verbose:
+                status_display = result.get("status", "Unknown")
                 if use_force:
                     status_display += " (forced rescan)"
                 print(f"Status: {status_display}")
@@ -87,22 +103,20 @@ class ZuluZscaler:
                 return result
 
             retries += 1
-            if retries >= max_retries:
-                if verbose:
-                    print(f"Max retries ({max_retries}) reached")
-                result["max_retries_reached"] = True
-                return result
+            if retries >= config.max_retries:
+                if config.verbose:
+                    print(f"Max retries ({config.max_retries}) reached")
+                return {**result, "max_retries_reached": True}
 
             elapsed = time.time() - start
-            if elapsed > timeout:
-                if verbose:
+            if elapsed > config.timeout:
+                if config.verbose:
                     print(f"Timeout reached after {elapsed:.1f}s")
-                result["timeout_reached"] = True
-                return result
+                return {**result, "timeout_reached": True}
 
             time.sleep(current_interval)
             # Exponential backoff with cap
-            current_interval = min(current_interval * 1.5, max_interval)
+            current_interval = min(current_interval * 1.5, config.max_interval)
 
     REQUEST_TIMEOUT = 30
 
@@ -128,7 +142,8 @@ class ZuluZscaler:
 
             # Show warning instead of suppressing - user should know about MITM risk
             logger.warning(
-                "SSL certificate verification is disabled. This exposes you to MITM attacks."
+                "[SECURITY_AUDIT] SSL certificate verification is disabled. "
+                f"verify_ssl={verify_ssl}. This exposes you to MITM attacks."
             )
         self.base_url = "https://zulu.zscaler.com"
         self.headers = {
@@ -243,14 +258,211 @@ class ZuluZscaler:
                 domain = domain[4:]
 
             return domain in self.safe_domains
-        except Exception as e:
-            # Log error but don't crash - treat unknown domains as not safe
-            import sys
-
+        except (ValueError, AttributeError) as e:
             logger.warning("Could not check domain safety: %s", str(e))
             return False
 
-    def analyze_url(self, url: str, force_rescan: bool = False) -> dict:
+    def _extract_form_endpoint(self, html: str) -> str:
+        """Extract the form action endpoint from HTML."""
+        form_pattern = r'<form[^>]*action="([^"]+)"[^>]*>'
+        form_match = re.search(form_pattern, html)
+        if form_match:
+            endpoint = form_match.group(1)
+            if not endpoint.startswith("http"):
+                endpoint = urljoin(self.base_url, endpoint)
+            return endpoint
+        return urljoin(self.base_url, "/")
+
+    def _parse_scan_status(self, html: str) -> str | None:
+        """Extract scan status from HTML."""
+        status_match = re.search(
+            r'<span class="left">Status</span>\s*<span[^>]*>([^<]+)</span>', html
+        )
+        return status_match.group(1).strip() if status_match else None
+
+    def _parse_basic_analysis(self, html: str) -> dict[str, Any]:
+        """Parse basic analysis fields from HTML."""
+        analysis = {}
+        fields = {
+            "redirections": r'id="rep-redir">([^<]+)</span>',
+            "http_status": r'id="rep-code">([^<]+)</span>',
+            "content_size": r'id="rep-size">([^<]+)</span>',
+            "content_type": r'id="rep-cont-type">([^<]+)</span>',
+            "ip_address": r'id="rep-ip">([^<]+)</span>',
+            "country": r'id="rep-country">([^<]+)</span>',
+            "web_server": r'id="rep-web-server">([^<]+)</span>',
+        }
+        for key, pattern in fields.items():
+            match = re.search(pattern, html)
+            if match:
+                analysis[key] = match.group(1).strip()
+        return analysis
+
+    def _parse_domain_history(self, html: str) -> list[dict[str, str]]:
+        """Parse domain history from HTML."""
+        domain_history = []
+        pattern = r'<p class="" id="rep-domain-hist">\s*<span class="first fg-color-mid-gray">([^<]+)</span>\s*<span class="second[^"]*"><a href="([^"]+)">([^<]+)</a></span>'
+        for match in re.finditer(pattern, html):
+            domain_history.append(
+                {
+                    "date": match.group(1).strip(),
+                    "report_id": match.group(2).strip("/report/"),
+                    "url": match.group(3).strip(" .."),
+                }
+            )
+        return domain_history
+
+    def _parse_check_section(
+        self, html: str, section_key: str, section_header: str
+    ) -> list[dict[str, str]]:
+        """Parse a single check section from HTML."""
+        items = []
+        section_pattern = f'<h1 class="margin-bottom-16">{section_header.replace("</h1>", "")}.*?<table.*?<tbody.*?>(.*?)</tbody>'
+        section = re.search(section_pattern, html, re.DOTALL)
+
+        if not section:
+            return items
+
+        section_content = section.group(1)
+        if section_key == "external_elements":
+            pattern = r'<tr>\s*<td class="link"><a[^>]*>([^<]+)</a></td>\s*<td><span[^>]*>([^<]+)</span></td>\s*</tr>'
+            for match in re.finditer(pattern, section_content):
+                items.append(
+                    {
+                        "url": match.group(1).strip(" .."),
+                        "risk": match.group(2).strip(),
+                    }
+                )
+        else:
+            pattern = r'<tr>\s*<td[^>]*><span class="report-icon-after">([^<]+)</span></td>\s*<td>([^<]*)</td>\s*<td class="fixed">([^<]+)</td>\s*</tr>'
+            for match in re.finditer(pattern, section_content):
+                items.append(
+                    {
+                        "test": match.group(1).strip(),
+                        "description": match.group(2).strip(),
+                        "risk": match.group(3).strip(),
+                    }
+                )
+        return items
+
+    def _parse_all_check_sections(self, html: str) -> dict[str, list[dict[str, str]]]:
+        """Parse all check sections from HTML."""
+        sections = {
+            "external_elements": "External Elements</h1>",
+            "content_checks": "Content Checks</h1>",
+            "url_checks": "URL Checks</h1>",
+            "host_checks": "Host Checks</h1>",
+        }
+        result = {}
+        for section_key, section_header in sections.items():
+            items = self._parse_check_section(html, section_key, section_header)
+            if items:
+                result[section_key] = items
+        return result
+
+    def _handle_force_rescan(
+        self, response: requests.Response, url: str
+    ) -> requests.Response:
+        """
+        Handle force rescan logic by triggering a fresh analysis.
+
+        Args:
+            response: The initial analysis response
+            url: The URL being analyzed
+
+        Returns:
+            Response object - either the new submission page or the original response
+        """
+        parent_id_match = re.search(
+            r'id=["\']parent_id["\'][^>]*>([^<]+)<', response.text
+        )
+        report_id_from_url = re.search(r"/report/([a-f0-9-]+)", response.url)
+
+        original_report_id = (
+            parent_id_match.group(1)
+            if parent_id_match
+            else (report_id_from_url.group(1) if report_id_from_url else None)
+        )
+
+        if not original_report_id:
+            return response
+
+        reanalyze_headers = {
+            **self.headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRF-Token": self.csrf_token,
+            "Referer": response.url,
+        }
+
+        reanalyze_response = self.session.post(
+            f"{self.base_url}/reanalyze",
+            headers=reanalyze_headers,
+            data={"id": original_report_id},
+            timeout=self.REQUEST_TIMEOUT,
+        )
+
+        if reanalyze_response.status_code != 200:
+            return response
+
+        try:
+            new_report = reanalyze_response.json()
+            if new_report and isinstance(new_report, dict):
+                new_report_id = new_report.get("id")
+                if new_report_id:
+                    return self.session.get(
+                        f"{self.base_url}/submission/{new_report_id}",
+                        headers=self.headers,
+                        timeout=self.REQUEST_TIMEOUT,
+                    )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+        return response
+
+    def _build_analyze_request_headers(self) -> dict[str, str]:
+        """
+        Build headers for the analysis POST request.
+
+        Returns:
+            Dictionary of headers for the analyze endpoint request.
+        """
+        headers = {
+            **self.headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://zulu.zscaler.com",
+            "Referer": self.base_url,
+        }
+
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+
+        return headers
+
+    def _fetch_analysis_page(
+        self, url: str, analyze_endpoint: str, headers: dict[str, str]
+    ) -> requests.Response:
+        """
+        Fetch the analysis page by POSTing the URL to the analyze endpoint.
+
+        Args:
+            url: The URL to analyze
+            analyze_endpoint: The endpoint URL for the analysis request
+            headers: Headers to include in the request
+
+        Returns:
+            Response object from the analysis POST request.
+        """
+        data = {"url": url, "csrf_token": self.csrf_token}
+
+        return self.session.post(
+            analyze_endpoint,
+            headers=headers,
+            data=data,
+            allow_redirects=True,
+            timeout=self.REQUEST_TIMEOUT,
+        )
+
+    def analyze_url(self, url: str, force_rescan: bool = False) -> UrlAnalysisResult:
         """
         Analyze a URL using Zulu Zscaler.
 
@@ -274,35 +486,11 @@ class ZuluZscaler:
 
         main_page = self.init_session()
 
-        form_pattern = r'<form[^>]*action="([^"]+)"[^>]*>'
-        form_match = re.search(form_pattern, main_page)
+        analyze_endpoint = self._extract_form_endpoint(main_page)
 
-        if form_match:
-            analyze_endpoint = form_match.group(1)
-            if not analyze_endpoint.startswith("http"):
-                analyze_endpoint = urljoin(self.base_url, analyze_endpoint)
-        else:
-            analyze_endpoint = urljoin(self.base_url, "/")
+        headers = self._build_analyze_request_headers()
 
-        headers = {
-            **self.headers,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://zulu.zscaler.com",
-            "Referer": self.base_url,
-        }
-
-        if self.csrf_token:
-            headers["X-CSRF-Token"] = self.csrf_token
-
-        data = {"url": url, "csrf_token": self.csrf_token}
-
-        response = self.session.post(
-            analyze_endpoint,
-            headers=headers,
-            data=data,
-            allow_redirects=True,
-            timeout=self.REQUEST_TIMEOUT,
-        )
+        response = self._fetch_analysis_page(url, analyze_endpoint, headers)
 
         # Check for rate limiting
         if response.status_code == 429:
@@ -310,55 +498,13 @@ class ZuluZscaler:
                 "url": url,
                 "status_code": 429,
                 "error": "Rate limited - too many requests. Please wait before retrying.",
-                "Status": "Rate Limited",
+                "status": "rate_limited",
             }
 
         # Handle force_rescan: trigger a fresh analysis
         if force_rescan:
-            # Extract report ID from the redirect URL
-            # Extract parent_id from page (more reliable than URL)
-            parent_id_match = re.search(
-                r'id=["\']parent_id["\'][^>]*>([^<]+)<', response.text
-            )
-            report_id_from_url = re.search(r"/report/([a-f0-9-]+)", response.url)
+            response = self._handle_force_rescan(response, url)
 
-            # Use parent_id from page if available, fall back to URL report ID
-            original_report_id = (
-                parent_id_match.group(1)
-                if parent_id_match
-                else (report_id_from_url.group(1) if report_id_from_url else None)
-            )
-
-            if original_report_id:
-                # POST to /reanalyze endpoint (must use form data, not JSON)
-                reanalyze_headers = {
-                    **self.headers,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "X-CSRF-Token": self.csrf_token,
-                    "Referer": response.url,
-                }
-
-                reanalyze_response = self.session.post(
-                    f"{self.base_url}/reanalyze",
-                    headers=reanalyze_headers,
-                    data={"id": original_report_id},
-                    timeout=self.REQUEST_TIMEOUT,
-                )
-
-                if reanalyze_response.status_code == 200:
-                    try:
-                        new_report = reanalyze_response.json()
-                        if new_report and isinstance(new_report, dict):
-                            new_report_id = new_report.get("id")
-                            if new_report_id:
-                                # Fetch the new submission page
-                                response = self.session.get(
-                                    f"{self.base_url}/submission/{new_report_id}",
-                                    headers=self.headers,
-                                    timeout=self.REQUEST_TIMEOUT,
-                                )
-                    except (json.JSONDecodeError, KeyError, TypeError):
-                        pass  # Fall back to original response
         status_match = re.search(
             r'<span class="left">Status</span>\s*<span[^>]*>([^<]+)</span>',
             response.text,
@@ -369,7 +515,7 @@ class ZuluZscaler:
             "url": url,
             "status_code": response.status_code,
             "content_type": response.headers.get("content-type"),
-            "Status": scan_status,
+            "status": scan_status.lower() if scan_status else "",
         }
 
         # Only parse and return analysis if status is Completed
@@ -471,9 +617,8 @@ class ZuluZscaler:
 
 
 def main():
-    """
-    Example usage for CLI and as a module. You can provide your own safe domains via --safe-domains.
-    """
+    """Entry point for CLI usage."""
+    configure_logging()
     parser = argparse.ArgumentParser(description="Analyze URLs with Zulu Zscaler.")
     parser.add_argument("url", help="URL to analyze")
     parser.add_argument(
