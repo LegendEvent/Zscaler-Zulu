@@ -174,24 +174,19 @@ class TestSSLWarning(unittest.TestCase):
     """Tests for SSL verification behavior."""
 
     def test_ssl_warning_on_no_verify(self):
-        """Warning should be printed when SSL verification is disabled."""
-        captured_output = StringIO()
-        sys.stderr = captured_output
-        
-        ZuluZscaler(verify_ssl=False)
-        
-        sys.stderr = sys.__stderr__
-        output = captured_output.getvalue()
-        self.assertIn("WARNING", output)
-        self.assertIn("SSL", output)
+        """Warning should be logged when SSL verification is disabled."""
+        with self.assertLogs("zulu_analyze", level="WARNING") as cm:
+            ZuluZscaler(verify_ssl=False)
+        self.assertTrue(any("SSL" in msg for msg in cm.output))
+        self.assertTrue(any("MITM" in msg for msg in cm.output))
 
     def test_no_warning_with_ssl_verify(self):
         """No warning should be printed when SSL verification is enabled."""
         captured_output = StringIO()
         sys.stderr = captured_output
-        
+
         ZuluZscaler(verify_ssl=True)
-        
+
         sys.stderr = sys.__stderr__
         output = captured_output.getvalue()
         self.assertNotIn("WARNING", output)
@@ -204,6 +199,7 @@ class TestPolling(unittest.TestCase):
         """poll_until_completed should accept max_retries parameter."""
         # This is a smoke test - we're just checking the method signature
         import inspect
+
         sig = inspect.signature(ZuluZscaler.poll_until_completed)
         params = list(sig.parameters.keys())
         self.assertIn("max_retries", params)
@@ -211,6 +207,7 @@ class TestPolling(unittest.TestCase):
     def test_force_rescan_parameter_exists(self):
         """poll_until_completed should accept force_rescan parameter."""
         import inspect
+
         sig = inspect.signature(ZuluZscaler.poll_until_completed)
         params = list(sig.parameters.keys())
         self.assertIn("force_rescan", params)
@@ -218,6 +215,7 @@ class TestPolling(unittest.TestCase):
     def test_analyze_url_force_rescan_parameter_exists(self):
         """analyze_url should accept force_rescan parameter."""
         import inspect
+
         sig = inspect.signature(ZuluZscaler.analyze_url)
         params = list(sig.parameters.keys())
         self.assertIn("force_rescan", params)
