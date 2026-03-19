@@ -60,6 +60,8 @@ class ZuluZscaler:
         "mycompany.com",
     ]
 
+    BASE_URL = "https://zulu.zscaler.com"
+
     def poll_until_completed(
         self,
         url: str,
@@ -138,14 +140,12 @@ class ZuluZscaler:
         self.session = requests.Session()
         self.session.verify = verify_ssl
         if not verify_ssl:
-            import urllib3
-
             # Show warning instead of suppressing - user should know about MITM risk
             logger.warning(
                 "[SECURITY_AUDIT] SSL certificate verification is disabled. "
                 f"verify_ssl={verify_ssl}. This exposes you to MITM attacks."
             )
-        self.base_url = "https://zulu.zscaler.com"
+        self.base_url = self.BASE_URL
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -224,7 +224,8 @@ class ZuluZscaler:
             ipaddress.ip_address(hostname)
             is_ip = True
         except ValueError:
-            pass  # Not an IP address, continue validation
+            # Not an IP address - expected error, continue validation
+            pass
 
         if is_ip:
             raise ValueError(
@@ -360,6 +361,27 @@ class ZuluZscaler:
                 result[section_key] = items
         return result
 
+    def _build_initial_result(
+        self, url: str, response: requests.Response, scan_status: str | None
+    ) -> dict[str, Any]:
+        """Build initial result dict with URL, status code, and scan status.
+
+        Args:
+            url: The analyzed URL
+            response: HTTP response object
+            scan_status: Parsed scan status from HTML
+
+        Returns:
+            Initial result dictionary with basic response information
+        """
+        status_value = scan_status.lower() if scan_status else ""
+        return {
+            "url": url,
+            "status_code": response.status_code,
+            "content_type": response.headers.get("content-type"),
+            "status": status_value,
+        }
+
     def _handle_force_rescan(
         self, response: requests.Response, url: str
     ) -> requests.Response:
@@ -414,8 +436,8 @@ class ZuluZscaler:
                         headers=self.headers,
                         timeout=self.REQUEST_TIMEOUT,
                     )
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.debug("Failed to parse reanalyze response: %s", str(e))
 
         return response
 
@@ -429,7 +451,7 @@ class ZuluZscaler:
         headers = {
             **self.headers,
             "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://zulu.zscaler.com",
+            "Origin": self.base_url,
             "Referer": self.base_url,
         }
 
@@ -478,11 +500,7 @@ class ZuluZscaler:
 
         # Check if URL is from a known safe domain
         if self.is_safe_domain(url):
-            return {
-                "url": url,
-                "status": "safe",
-                "message": "Domain is in the known safe list",
-            }
+            return create_safe_domain_result(url, "Domain is in the known safe list")
 
         main_page = self.init_session()
 
@@ -494,29 +512,17 @@ class ZuluZscaler:
 
         # Check for rate limiting
         if response.status_code == 429:
-            return {
-                "url": url,
-                "status_code": 429,
-                "error": "Rate limited - too many requests. Please wait before retrying.",
-                "status": "rate_limited",
-            }
+            return create_rate_limited_result(
+                url,
+                "Rate limited - too many requests. Please wait before retrying.",
+            )
 
         # Handle force_rescan: trigger a fresh analysis
         if force_rescan:
             response = self._handle_force_rescan(response, url)
 
-        status_match = re.search(
-            r'<span class="left">Status</span>\s*<span[^>]*>([^<]+)</span>',
-            response.text,
-        )
-        scan_status = status_match.group(1).strip() if status_match else None
-
-        result = {
-            "url": url,
-            "status_code": response.status_code,
-            "content_type": response.headers.get("content-type"),
-            "status": scan_status.lower() if scan_status else "",
-        }
+        scan_status = self._parse_scan_status(response.text)
+        result = self._build_initial_result(url, response, scan_status)
 
         # Only parse and return analysis if status is Completed
         if scan_status and scan_status.lower() == "completed":
@@ -538,76 +544,19 @@ class ZuluZscaler:
             if class_match:
                 result["classification"] = class_match.group(1)
 
-            # Extract Analysis section
-            analysis = {}
+            # Parse analysis sections using existing helper methods
+            analysis = self._parse_basic_analysis(response.text)
 
-            # Basic Analysis
-            fields = {
-                "redirections": r'id="rep-redir">([^<]+)</span>',
-                "http_status": r'id="rep-code">([^<]+)</span>',
-                "content_size": r'id="rep-size">([^<]+)</span>',
-                "content_type": r'id="rep-cont-type">([^<]+)</span>',
-                "ip_address": r'id="rep-ip">([^<]+)</span>',
-                "country": r'id="rep-country">([^<]+)</span>',
-                "web_server": r'id="rep-web-server">([^<]+)</span>',
-            }
-
-            for key, pattern in fields.items():
-                match = re.search(pattern, response.text)
-                if match:
-                    analysis[key] = match.group(1).strip()
-
-            # Domain History
-            domain_history = []
-            history_pattern = r'<p class="" id="rep-domain-hist">\s*<span class="first fg-color-mid-gray">([^<]+)</span>\s*<span class="second[^"]*"><a href="([^"]+)">([^<]+)</a></span>'
-            for match in re.finditer(history_pattern, response.text):
-                domain_history.append(
-                    {
-                        "date": match.group(1).strip(),
-                        "report_id": match.group(2).strip("/report/"),
-                        "url": match.group(3).strip(" .."),
-                    }
-                )
+            # Parse domain history using existing helper method
+            domain_history = self._parse_domain_history(response.text)
             if domain_history:
                 analysis["domain_history"] = domain_history
 
             result["analysis"] = analysis
 
-            # Extract sections with checks
-            sections = {
-                "external_elements": "External Elements</h1>",
-                "content_checks": "Content Checks</h1>",
-                "url_checks": "URL Checks</h1>",
-                "host_checks": "Host Checks</h1>",
-            }
-
-            for section_key, section_header in sections.items():
-                items = []
-                # Fix escape sequence and improve pattern to find table content
-                section_pattern = f'<h1 class="margin-bottom-16">{section_header.replace("</h1>", "")}.*?<table.*?<tbody.*?>(.*?)</tbody>'
-                section = re.search(section_pattern, response.text, re.DOTALL)
-
-                if section:
-                    if section_key == "external_elements":
-                        # Pattern für externe Elemente mit Links
-                        pattern = r'<tr>\s*<td class="link"><a[^>]*>([^<]+)</a></td>\s*<td><span[^>]*>([^<]+)</span></td>\s*</tr>'
-                        for match in re.finditer(pattern, section.group(1)):
-                            items.append(
-                                {
-                                    "url": match.group(1).strip(" .."),
-                                    "risk": match.group(2).strip(),
-                                }
-                            )
-                    else:
-                        # Pattern für Content, URL und Host Checks - berücksichtigt leere Descriptions
-                        pattern = r'<tr>\s*<td[^>]*><span class="report-icon-after">([^<]+)</span></td>\s*<td>([^<]*)</td>\s*<td class="fixed">([^<]+)</td>\s*</tr>'
-                        for match in re.finditer(pattern, section.group(1)):
-                            test = match.group(1).strip()
-                            description = match.group(2).strip()
-                            risk = match.group(3).strip()
-                            items.append(
-                                {"test": test, "description": description, "risk": risk}
-                            )
+            # Parse all check sections using existing helper method
+            sections_data = self._parse_all_check_sections(response.text)
+            for section_key, items in sections_data.items():
                 if items:
                     result[section_key] = items
         else:
@@ -616,7 +565,7 @@ class ZuluZscaler:
         return result
 
 
-def main():
+def main() -> None:
     """Entry point for CLI usage."""
     configure_logging()
     parser = argparse.ArgumentParser(description="Analyze URLs with Zulu Zscaler.")
