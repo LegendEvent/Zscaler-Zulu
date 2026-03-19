@@ -8,7 +8,28 @@ Uses TypedDict for type checking while maintaining backward compatibility.
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, Literal, Union
-from typing_extensions import TypedDict, Required, NotRequired
+from typing import TypedDict, Required, NotRequired
+
+
+__all__ = [
+    # Result types
+    "SafeDomainResult",
+    "RateLimitedResult",
+    "ErrorResult",
+    "InProgressResult",
+    "AnalysisResult",
+    "UrlAnalysisResult",
+    # Factory functions
+    "create_safe_domain_result",
+    "create_rate_limited_result",
+    "create_error_result",
+    "create_in_progress_result",
+    "create_analysis_result",
+    # Helper functions
+    "get_status",
+    "is_safe",
+    "is_error",
+]
 
 
 # Base fields present in all result types
@@ -17,7 +38,6 @@ class _BaseFields(TypedDict):
 
     url: str
     status: str
-    Status: str  # Backward compatibility with existing callers
 
 
 class SafeDomainResult(_BaseFields, TypedDict):
@@ -25,8 +45,9 @@ class SafeDomainResult(_BaseFields, TypedDict):
 
     url: str
     status: Required[Literal["safe"]]
-    Status: str
     message: str
+    max_retries_reached: NotRequired[bool]
+    timeout_reached: NotRequired[bool]
 
 
 class RateLimitedResult(_BaseFields, TypedDict):
@@ -34,10 +55,11 @@ class RateLimitedResult(_BaseFields, TypedDict):
 
     url: str
     status: Required[Literal["rate_limited"]]
-    Status: str
     status_code: Required[int]
     error: str
     retry_after: NotRequired[int]  # Optional: seconds to wait
+    max_retries_reached: NotRequired[bool]
+    timeout_reached: NotRequired[bool]
 
 
 class ErrorResult(_BaseFields, TypedDict):
@@ -45,10 +67,11 @@ class ErrorResult(_BaseFields, TypedDict):
 
     url: str
     status: Required[Literal["error"]]
-    Status: str
     status_code: int
     error: str
     retryable: NotRequired[bool]  # Optional: whether to retry
+    max_retries_reached: NotRequired[bool]
+    timeout_reached: NotRequired[bool]
 
 
 class InProgressResult(_BaseFields, TypedDict):
@@ -56,7 +79,8 @@ class InProgressResult(_BaseFields, TypedDict):
 
     url: str
     status: Required[Literal["in_progress"]]
-    Status: str
+    max_retries_reached: NotRequired[bool]
+    timeout_reached: NotRequired[bool]
 
 
 class AnalysisResult(_BaseFields, TypedDict):
@@ -64,7 +88,6 @@ class AnalysisResult(_BaseFields, TypedDict):
 
     url: str
     status: Required[Literal["completed", "failed"]]
-    Status: str
     status_code: int
     score: int
     classification: str
@@ -74,6 +97,8 @@ class AnalysisResult(_BaseFields, TypedDict):
     host_checks: NotRequired[Dict[str, Any]]
     error: NotRequired[str]
     message: NotRequired[str]
+    max_retries_reached: NotRequired[bool]
+    timeout_reached: NotRequired[bool]
 
 
 # Union type for all possible result types
@@ -92,46 +117,20 @@ UrlAnalysisResult = Union[
 
 
 def create_safe_domain_result(url: str, message: str) -> SafeDomainResult:
-    """
-    Create a safe domain result.
-
-    Args:
-        url: The analyzed URL
-        message: Explanation of why the domain is safe
-
-    Returns:
-        SafeDomainResult dict with status="safe"
-    """
+    """Create a safe domain result."""
     return SafeDomainResult(
         url=url,
         status="safe",
-        Status="Safe",
         message=message,
     )
 
 
 def create_rate_limited_result(
-    url: str,
-    error: str,
-    status_code: int = 429,
-    retry_after: Optional[int] = None,
+    url: str, error: str, status_code: int = 429, retry_after: Optional[int] = None
 ) -> RateLimitedResult:
-    """
-    Create a rate limit result.
-
-    Args:
-        url: The analyzed URL
-        error: Error message
-        status_code: HTTP status code (default: 429)
-        retry_after: Optional seconds to wait before retry
-
-    Returns:
-        RateLimitedResult dict with status="rate_limited"
-    """
     result: RateLimitedResult = RateLimitedResult(
         url=url,
         status="rate_limited",
-        Status="Rate Limited",
         status_code=status_code,
         error=error,
     )
@@ -161,7 +160,6 @@ def create_error_result(
     result: ErrorResult = ErrorResult(
         url=url,
         status="error",
-        Status="Error",
         status_code=status_code,
         error=error,
     )
@@ -183,7 +181,6 @@ def create_in_progress_result(url: str) -> InProgressResult:
     return InProgressResult(
         url=url,
         status="in_progress",
-        Status="In Progress",
     )
 
 
@@ -223,7 +220,6 @@ def create_analysis_result(
     result: AnalysisResult = AnalysisResult(
         url=url,
         status=status_value,
-        Status=status_value.replace("_", " ").title(),
         status_code=status_code,
         score=score,
         classification=classification,
@@ -271,11 +267,9 @@ def is_safe(result: UrlAnalysisResult) -> bool:
         result: Any UrlAnalysisResult type
 
     Returns:
-        True if the URL is safe
+        True if the URL is safe (status field is "safe")
     """
-    return result["status"] == "safe" or (
-        result.get("classification", "").lower() == "safe" and not result.get("error")
-    )
+    return result["status"] == "safe"
 
 
 def is_error(result: UrlAnalysisResult) -> bool:

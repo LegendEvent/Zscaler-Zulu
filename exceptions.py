@@ -23,7 +23,7 @@ class ZuluException(Exception):
         url: Optional[str] = None,
         original_exception: Optional[Exception] = None,
     ) -> None:
-        """Initialize the ZuluException.
+        """Initialize ZuluException.
 
         Args:
             message: The error message.
@@ -34,14 +34,8 @@ class ZuluException(Exception):
         self.url = url
         self.original_exception = original_exception
 
-        # Build the error message with context
-        full_message = message
-        if url:
-            full_message = f"{full_message} (URL: {url})"
-        if original_exception:
-            full_message = f"{full_message} | Caused by: {type(original_exception).__name__}: {original_exception}"
-
-        super().__init__(full_message)
+        # Build error message with context (handled in base class)
+        super().__init__(message, url, original_exception)
 
 
 class URLValidationError(ZuluException):
@@ -60,7 +54,7 @@ class URLValidationError(ZuluException):
         url: Optional[str] = None,
         original_exception: Optional[Exception] = None,
     ) -> None:
-        """Initialize the URLValidationError.
+        """Initialize URLValidationError.
 
         Args:
             message: The error message (default: "URL validation failed").
@@ -83,7 +77,7 @@ class RateLimitError(ZuluException):
         url: Optional[str] = None,
         original_exception: Optional[Exception] = None,
     ) -> None:
-        """Initialize the RateLimitError.
+        """Initialize RateLimitError.
 
         Args:
             message: The error message (default: "Rate limit exceeded (HTTP 429)").
@@ -109,7 +103,7 @@ class AnalysisError(ZuluException):
         url: Optional[str] = None,
         original_exception: Optional[Exception] = None,
     ) -> None:
-        """Initialize the AnalysisError.
+        """Initialize AnalysisError.
 
         Args:
             message: The error message (default: "Analysis failed").
@@ -136,7 +130,7 @@ class NetworkError(ZuluException):
         url: Optional[str] = None,
         original_exception: Optional[Exception] = None,
     ) -> None:
-        """Initialize the NetworkError.
+        """Initialize NetworkError.
 
         Args:
             message: The error message (default: "Network error occurred").
