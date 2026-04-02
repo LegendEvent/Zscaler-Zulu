@@ -37,8 +37,18 @@ class ZuluException(Exception):
         # Build error message with context (handled in base class)
         super().__init__(message, url, original_exception)
 
+    def __str__(self) -> str:
+        parts = [self.message]
+        if self.url:
+            parts.append(f"URL: {self.url}")
+        if self.original_exception:
+            parts.append(
+                f"Caused by: {type(self.original_exception).__name__}: {self.original_exception}"
+            )
+        return " | ".join(parts)
 
-class URLValidationError(ZuluException):
+
+class URLValidationError(ZuluException, ValueError):
     """Exception raised for invalid URL validation errors.
 
     This includes errors related to:

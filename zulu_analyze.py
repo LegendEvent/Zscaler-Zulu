@@ -21,6 +21,7 @@ from result_types import (
     UrlAnalysisResult,
     create_safe_domain_result,
     create_rate_limited_result,
+    create_error_result,
 )
 
 __all__ = [
@@ -186,9 +187,9 @@ class ZuluZscaler:
 
     @staticmethod
     def _validate_url(url: str) -> str:
-        """Validate and normalize URL. Returns normalized URL or raises ValueError."""
+        """Validate and normalize URL. Returns normalized URL or raises URLValidationError."""
         if not url or not isinstance(url, str):
-            raise ValueError("URL must be a non-empty string")
+            raise URLValidationError("URL must be a non-empty string")
 
         url = url.strip()
 
@@ -201,7 +202,7 @@ class ZuluZscaler:
             "https",
             "",
         ):
-            raise ValueError(
+            raise URLValidationError(
                 f"Only http/https schemes are allowed, got: '{temp_parsed.scheme}'"
             )
 
@@ -213,31 +214,71 @@ class ZuluZscaler:
         parsed = urlparse(url)
 
         if not parsed.netloc:
-            raise ValueError(f"Invalid URL: could not extract domain from '{url}'")
+            raise URLValidationError(
+                f"Invalid URL: could not extract domain from '{url}'"
+            )
 
         hostname = parsed.netloc.split(":")[0]  # Remove port if present
 
         # Block direct IP addresses to prevent SSRF attacks
-        # Use a flag to avoid catching our own ValueError
         is_ip = False
         try:
             ipaddress.ip_address(hostname)
             is_ip = True
         except ValueError:
-            # Not an IP address - expected error, continue validation
             pass
 
         if is_ip:
-            raise ValueError(
+            raise URLValidationError(
                 f"Direct IP addresses are not allowed for security reasons: '{hostname}'"
             )
+
+        # Block obfuscated IP addresses (SSRF bypass via hex, octal, decimal, leading zeros)
+        if re.match(r"^0x[0-9a-fA-F]+$", hostname):
+            raise URLValidationError(
+                f"Hexadecimal IP addresses are not allowed for security reasons: '{hostname}'"
+            )
+        if re.match(r"^0[0-7]+$", hostname):
+            raise URLValidationError(
+                f"Octal IP addresses are not allowed for security reasons: '{hostname}'"
+            )
+        if re.match(r"^\d{1,10}$", hostname):
+            try:
+                if 0 <= int(hostname) <= 4294967295:
+                    raise URLValidationError(
+                        f"Decimal IP addresses are not allowed for security reasons: '{hostname}'"
+                    )
+            except URLValidationError:
+                raise
+            except ValueError:
+                pass
+        if re.match(r"^\d+\.0\d+", hostname):
+            raise URLValidationError(
+                f"IP addresses with leading zeros are not allowed for security reasons: '{hostname}'"
+            )
+
+        # Block known localhost-redirecting domains (SSRF bypass)
+        _localhost_blocklist = (
+            "localtest.me",
+            "vcap.me",
+            "nip.io",
+            "sslip.io",
+            "pointer.to",
+            "lvh.me",
+            "customercloud.app",
+        )
+        for blocked in _localhost_blocklist:
+            if hostname == blocked or hostname.endswith("." + blocked):
+                raise URLValidationError(
+                    f"Domain '{hostname}' is blocked as it may redirect to localhost"
+                )
 
         # Validate hostname characters (alphanumeric, hyphens, dots only)
         if not re.match(
             r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$",
             hostname,
         ):
-            raise ValueError(
+            raise URLValidationError(
                 f"Invalid hostname: '{hostname}' contains invalid characters"
             )
 
@@ -269,8 +310,14 @@ class ZuluZscaler:
         form_match = re.search(form_pattern, html)
         if form_match:
             endpoint = form_match.group(1)
-            if not endpoint.startswith("http"):
+            if not endpoint.startswith(("http://", "https://")):
                 endpoint = urljoin(self.base_url, endpoint)
+            parsed = urlparse(endpoint)
+            base_parsed = urlparse(self.base_url)
+            if parsed.scheme not in ("http", "https") or (
+                parsed.netloc and parsed.netloc != base_parsed.netloc
+            ):
+                return urljoin(self.base_url, "/")
             return endpoint
         return urljoin(self.base_url, "/")
 
@@ -412,9 +459,10 @@ class ZuluZscaler:
         reanalyze_headers = {
             **self.headers,
             "Content-Type": "application/x-www-form-urlencoded",
-            "X-CSRF-Token": self.csrf_token,
             "Referer": response.url,
         }
+        if self.csrf_token:
+            reanalyze_headers["X-CSRF-Token"] = self.csrf_token
 
         reanalyze_response = self.session.post(
             f"{self.base_url}/reanalyze",
@@ -474,7 +522,9 @@ class ZuluZscaler:
         Returns:
             Response object from the analysis POST request.
         """
-        data = {"url": url, "csrf_token": self.csrf_token}
+        data = {"url": url}
+        if self.csrf_token:
+            data["csrf_token"] = self.csrf_token
 
         return self.session.post(
             analyze_endpoint,
@@ -502,7 +552,12 @@ class ZuluZscaler:
         if self.is_safe_domain(url):
             return create_safe_domain_result(url, "Domain is in the known safe list")
 
-        main_page = self.init_session()
+        try:
+            main_page = self.init_session()
+        except requests.exceptions.RequestException as e:
+            raise NetworkError(
+                f"Failed to connect to Zulu Zscaler: {e}", url=url, original_exception=e
+            ) from e
 
         analyze_endpoint = self._extract_form_endpoint(main_page)
 
@@ -515,6 +570,14 @@ class ZuluZscaler:
             return create_rate_limited_result(
                 url,
                 "Rate limited - too many requests. Please wait before retrying.",
+            )
+
+        if response.status_code >= 400:
+            return create_error_result(
+                url,
+                f"HTTP {response.status_code} from Zulu Zscaler",
+                response.status_code,
+                retryable=response.status_code >= 500,
             )
 
         # Handle force_rescan: trigger a fresh analysis
@@ -594,7 +657,7 @@ def main() -> None:
     try:
         result = zulu.poll_until_completed(args.url, force_rescan=args.force_rescan)
         print(json.dumps(result, indent=2))
-    except Exception as e:
+    except (ZuluException, requests.exceptions.RequestException) as e:
         logger.error("Error: %s", str(e))
         logger.error(
             "Note: Check if the Zulu Zscaler website is reachable and you are not hitting rate limits."
