@@ -93,7 +93,28 @@ class ZuluZscaler:
             use_force = force_rescan and not force_used
             if use_force:
                 force_used = True
-            result = self.analyze_url(url, force_rescan=use_force)
+            try:
+                result = self.analyze_url(url, force_rescan=use_force)
+            except NetworkError:
+                retries += 1
+                if retries >= config.max_retries:
+                    if config.verbose:
+                        print(
+                            f"Max retries ({config.max_retries}) reached due to network errors"
+                        )
+                    return {
+                        "url": url,
+                        "status": "error",
+                        "error": "Network error during polling",
+                        "max_retries_reached": True,
+                    }
+                if config.verbose:
+                    print(
+                        f"Network error during polling, retrying ({retries}/{config.max_retries})..."
+                    )
+                time.sleep(current_interval)
+                current_interval = min(current_interval * 1.5, config.max_interval)
+                continue
             status = result.get("status", "").lower() if result.get("status") else ""
 
             if config.verbose:
@@ -121,7 +142,7 @@ class ZuluZscaler:
             # Exponential backoff with cap
             current_interval = min(current_interval * 1.5, config.max_interval)
 
-    REQUEST_TIMEOUT = 30
+    REQUEST_TIMEOUT = 60
 
     def __init__(
         self, default_safe_domains: list[str] | None = None, verify_ssl: bool = True
@@ -552,12 +573,19 @@ class ZuluZscaler:
         if self.is_safe_domain(url):
             return create_safe_domain_result(url, "Domain is in the known safe list")
 
-        try:
-            main_page = self.init_session()
-        except requests.exceptions.RequestException as e:
-            raise NetworkError(
-                f"Failed to connect to Zulu Zscaler: {e}", url=url, original_exception=e
-            ) from e
+        if self.csrf_token is None:
+            try:
+                main_page = self.init_session()
+            except requests.exceptions.RequestException as e:
+                raise NetworkError(
+                    f"Failed to connect to Zulu Zscaler: {e}",
+                    url=url,
+                    original_exception=e,
+                ) from e
+        else:
+            main_page = self.session.get(
+                self.base_url, headers=self.headers, timeout=self.REQUEST_TIMEOUT
+            ).text
 
         analyze_endpoint = self._extract_form_endpoint(main_page)
 
