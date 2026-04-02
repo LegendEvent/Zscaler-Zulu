@@ -11,6 +11,7 @@ import sys
 from io import StringIO
 
 from zulu_analyze import ZuluZscaler
+from exceptions import URLValidationError
 
 
 class TestURLValidation(unittest.TestCase):
@@ -58,89 +59,89 @@ class TestURLValidation(unittest.TestCase):
     # SSRF Protection Tests - IP addresses should be blocked
     def test_block_localhost_ip(self):
         """127.0.0.1 should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("http://127.0.0.1")
         self.assertIn("IP addresses", str(ctx.exception))
 
     def test_block_private_ip_10_range(self):
         """10.x.x.x private IP should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("http://10.0.0.1")
         self.assertIn("IP addresses", str(ctx.exception))
 
     def test_block_private_ip_192_168_range(self):
         """192.168.x.x private IP should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("http://192.168.1.1")
         self.assertIn("IP addresses", str(ctx.exception))
 
     def test_block_private_ip_172_range(self):
         """172.16.x.x private IP should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("http://172.16.0.1")
         self.assertIn("IP addresses", str(ctx.exception))
 
     def test_block_aws_metadata_endpoint(self):
         """AWS metadata IP 169.254.169.254 should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("http://169.254.169.254")
         self.assertIn("IP addresses", str(ctx.exception))
 
     def test_block_public_ip(self):
         """Even public IP addresses should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("http://8.8.8.8")
         self.assertIn("IP addresses", str(ctx.exception))
 
     # Scheme Validation Tests
     def test_block_file_scheme(self):
         """file:// scheme should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("file:///etc/passwd")
         self.assertIn("http/https", str(ctx.exception).lower())
 
     def test_block_javascript_scheme(self):
         """javascript: scheme should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("javascript:alert(1)")
         self.assertIn("http/https", str(ctx.exception).lower())
 
     def test_block_ftp_scheme(self):
         """ftp:// scheme should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("ftp://example.com/file")
         self.assertIn("http/https", str(ctx.exception).lower())
 
     def test_block_gopher_scheme(self):
         """gopher:// scheme should be blocked."""
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(URLValidationError) as ctx:
             ZuluZscaler._validate_url("gopher://example.com")
         self.assertIn("http/https", str(ctx.exception).lower())
 
     # Invalid Input Tests
     def test_empty_url(self):
-        """Empty URL should raise ValueError."""
-        with self.assertRaises(ValueError):
+        """Empty URL should raise URLValidationError."""
+        with self.assertRaises(URLValidationError):
             ZuluZscaler._validate_url("")
 
     def test_none_url(self):
-        """None URL should raise ValueError."""
-        with self.assertRaises(ValueError):
+        """None URL should raise URLValidationError."""
+        with self.assertRaises(URLValidationError):
             ZuluZscaler._validate_url(None)
 
     def test_whitespace_only_url(self):
         """Whitespace-only URL should raise ValueError after trim."""
-        with self.assertRaises(ValueError):
+        with self.assertRaises(URLValidationError):
             ZuluZscaler._validate_url("   ")
 
     def test_invalid_hostname_chars(self):
         """Hostname with invalid characters should be blocked."""
-        with self.assertRaises(ValueError):
+        with self.assertRaises(URLValidationError):
             ZuluZscaler._validate_url("http://example_.com")
 
     def test_hostname_starts_with_hyphen(self):
         """Hostname starting with hyphen should be blocked."""
-        with self.assertRaises(ValueError):
+        with self.assertRaises(URLValidationError):
             ZuluZscaler._validate_url("http://-example.com")
 
 
